@@ -6,7 +6,7 @@ Főbb komponensek:
 
     Vezérlő: Arduino Uno R3 + Sensor Shield V5.0
 
-    Meghajtás: L298N (vagy L293D) H-híd motorvezérlő + 2 db DC motor
+    Meghajtás: L298N (vagy L293D) H-híd motorvezérlő + 4 db DC motor
 
     Érzékelés:  
         - HC-SR04 Ultrahangos távolságmérő (szervóra rögzítve)
