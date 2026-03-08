@@ -1,7 +1,6 @@
 # Sensor-driven-car
 Hardverarchitektúra
 
-A rendszer felépítése a hatékony erőforrás-gazdálkodásra törekszik, különös tekintettel az Arduino Uno korlátos I/O lábszámára.
 Főbb komponensek:
 
     Vezérlő: Arduino Uno R3 + Sensor Shield V5.0
@@ -12,3 +11,10 @@ Főbb komponensek:
         - HC-SR04 Ultrahangos távolságmérő (szervóra rögzítve)
         - Infravörös (IR) vevőegység
         - Optikai vonalkövető szenzor
+
+    Továbbiakban hozzáépítésre kerül:
+        - 170 lyukas próbapanel
+        - Megjelenítés: 
+            -1-digites 7-szegmenses kijelző
+        -Logikai bővítés: 74HC595 Shift Register (a kijelző vezérléséhez, lábtakarékossági célból)
+    
