@@ -1,0 +1,45 @@
+// --- Motor kivezetesek ---
+#define ENA 5   // Bal sebesseg
+#define IN1 2   // Bal A
+#define IN2 4   // Bal B
+#define IN3 7   // Jobb A
+#define IN4 8   // Jobb B
+#define ENB 10  // Jobb sebesseg
+
+void setup() {
+  // Pin-ek beallitasa kimenetkent
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+
+  delay(2000); // 2 masodperc varakozas, mielott elindulna
+
+  // --- MOTOROK INDITASA ---
+  // Bal oldal elore
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, 200); // Sebesseg (0-255)
+
+  // Jobb oldal elore
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, 200); // Sebesseg (0-255)
+
+  // --- IDOTARTAM ---
+  // Itt tudod allitani, mennyit forogjon. 
+  // Ha tul sokat fordul, vedd lejjebb (pl. 500), ha tul keveset, 
+  // akkor emeld meg (pl. 900).
+  delay(700); 
+
+  // --- MOTOROK LEALLITASA ---
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, 0);
+  
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, 0);
+}
+
+void loop() {
+  // A loop ures, igy a teszt nem ismetlodik meg.
+}

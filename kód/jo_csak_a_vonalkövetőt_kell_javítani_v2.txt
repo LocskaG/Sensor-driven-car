@@ -1,0 +1,583 @@
+#include <IRremote.h>
+#include <Servo.h>
+
+// --- MOTOR PINEK ---
+#define ENA 5
+#define IN1 2
+#define IN2 4
+#define IN3 7
+#define IN4 8
+#define ENB 10
+
+// --- SZENZOR PINEK ---
+const int RECV_PIN = 12;
+const int TRIG_PIN = A1;
+const int ECHO_PIN = A0;
+const int SERVO_PIN = 3;
+const int L_SENS = 6;
+const int M_SENS = 9;
+const int R_SENS = 11;
+
+// --- SZERVO SZOGEK ---
+const int SERVO_CENTER = 90;
+const int SERVO_LEFT   = 160;
+const int SERVO_RIGHT  = 20;
+
+// --- TAVOLSAGOK (cm) ---
+const int DIST_STOP   = 35;
+const int DIST_SAFE   = 60;
+const int DIST_LINE_STOP = 15;  // vonalkovetesben ennel kozelebb -> megall
+
+// --- IDOZITESEK ---
+const int SERVO_TURN_TIME = 400;
+const int SENSOR_INTERVAL = 50;
+unsigned long lastSensorMs = 0;
+long lastDistance = 100;
+
+const unsigned long CHECK_INTERVAL_MS = 2000;  // ~50 cm
+unsigned long forwardStartMs = 0;
+bool isMovingForward = false;
+
+// Vonalkoveto: utolso ervenyes irany emlekezese
+// (ha elveszti a vonalat, ebbe az iranyba keres)
+int lastLineDirection = 0;  // 0=elore, -1=bal, 1=jobb
+
+enum State { OFF, STANDBY, LINE_FOLLOW, OBSTACLE_AVOID, MANUAL };
+State currentState = OFF;
+bool obstacleInitialized = false;
+
+Servo headServo;
+
+// =====================================================
+// IR MEGSZAKITAS ELLENORZES
+// =====================================================
+bool checkForStopCommand() {
+  if (!IrReceiver.decode()) return false;
+
+  uint16_t cmd = IrReceiver.decodedIRData.command;
+  IrReceiver.resume();
+
+  if (cmd == 0) return false;
+
+  if (cmd == 0x1C || cmd == 0x47 || cmd == 0x45 || cmd == 0x46) {
+    Serial.print(F("MEGSZAKITAS: 0x"));
+    Serial.println(cmd, HEX);
+    return true;
+  }
+  return false;
+}
+
+// Megszakithato delay - 10 ms-enkent ellenoriz IR-t (suruben!)
+bool interruptibleDelay(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (checkForStopCommand()) return true;
+    delay(10);  // suru ellenorzes - rovid IR jelek se vesszenek el
+  }
+  return false;
+}
+
+// =====================================================
+// MOZGAS
+// =====================================================
+void stopMotors() {
+  digitalWrite(ENA, LOW); digitalWrite(ENB, LOW);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  isMovingForward = false;
+}
+
+void moveForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); digitalWrite(ENA, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); digitalWrite(ENB, HIGH);
+  if (!isMovingForward) {
+    forwardStartMs = millis();
+    isMovingForward = true;
+  }
+}
+
+void moveBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); digitalWrite(ENA, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); digitalWrite(ENB, HIGH);
+  isMovingForward = false;
+}
+
+void spinLeft() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); digitalWrite(ENA, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  digitalWrite(ENB, HIGH);
+  isMovingForward = false;
+}
+
+void spinRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  digitalWrite(ENA, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); digitalWrite(ENB, HIGH);
+  isMovingForward = false;
+}
+
+void manualLeft() {
+  digitalWrite(ENA, LOW);  digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+  digitalWrite(ENB, HIGH); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void manualRight() {
+  digitalWrite(ENA, HIGH); digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(ENB, LOW);  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+}
+
+// =====================================================
+// ARANYOS MOTORVEZERLES (vonalkovetes finomhangolasahoz)
+// Mindket motor megy elore, de kulonbozo sebesseggel - iv-ben kanyarodik
+// leftSpeed/rightSpeed: 0-255 PWM
+// =====================================================
+void driveCurve(int leftSpeed, int rightSpeed) {
+  // Bal motor (ENA - IN1/IN2)
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  analogWrite(ENA, leftSpeed);
+  // Jobb motor (ENB - IN3/IN4)
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENB, rightSpeed);
+  // Az "elore halad" flag-et beallitjuk, hogy a tavolsag-szamlalo
+  // is mukodjon ha akadalykerulesben hasznalnank
+  if (!isMovingForward) {
+    forwardStartMs = millis();
+    isMovingForward = true;
+  }
+}
+
+// =====================================================
+// TAVOLSAGMERES
+// =====================================================
+long checkDistance() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return 100;
+  return duration * 0.034 / 2;
+}
+
+long checkDistanceMedian() {
+  long m[3];
+  for (int i = 0; i < 3; i++) {
+    m[i] = checkDistance();
+    delay(10);
+  }
+  if (m[0] > m[1]) { long t = m[0]; m[0] = m[1]; m[1] = t; }
+  if (m[1] > m[2]) { long t = m[1]; m[1] = m[2]; m[2] = t; }
+  if (m[0] > m[1]) { long t = m[0]; m[0] = m[1]; m[1] = t; }
+  return m[1];
+}
+
+// Szervot egy szogbe forgat - kozben IR-t figyel
+// Visszater -1 ha megszakitas tortent (akkor a tavolsag ervenytelen)
+long lookAtAngle(int angle) {
+  headServo.write(angle);
+  // Megszakithato varakozas a szervo allasara
+  if (interruptibleDelay(SERVO_TURN_TIME)) {
+    return -1;
+  }
+  long d = checkDistanceMedian();
+  Serial.print(F("  Szog ")); Serial.print(angle);
+  Serial.print(F(" -> ")); Serial.print(d); Serial.println(F(" cm"));
+  return d;
+}
+
+// =====================================================
+// KORBENEZES 3 PONTRA
+// =====================================================
+int scan3Points(long &distLeft, long &distCenter, long &distRight) {
+  Serial.println(F("--- Korbenezes ---"));
+  distLeft = lookAtAngle(SERVO_LEFT);
+  if (distLeft < 0) return -99;  // megszakitas
+
+  distCenter = lookAtAngle(SERVO_CENTER);
+  if (distCenter < 0) return -99;
+
+  distRight = lookAtAngle(SERVO_RIGHT);
+  if (distRight < 0) return -99;
+
+  headServo.write(SERVO_CENTER);
+  if (interruptibleDelay(150)) return -99;
+
+  if (distCenter > DIST_SAFE) return 0;
+  if (distLeft < DIST_STOP && distRight < DIST_STOP) return -2;
+  if (distLeft > distRight) return -1;
+  return +1;
+}
+
+// =====================================================
+// INDULAS ELOTTI ALAPOS KORBENEZES
+// =====================================================
+bool initialScan() {
+  Serial.println(F("=== Indulas elotti alapos korbenezes ==="));
+  stopMotors();
+
+  int angles[5] = { SERVO_LEFT, 125, SERVO_CENTER, 55, SERVO_RIGHT };
+  for (int i = 0; i < 5; i++) {
+    long d = lookAtAngle(angles[i]);
+    if (d < 0) {
+      headServo.write(SERVO_CENTER);
+      return true;
+    }
+  }
+
+  headServo.write(SERVO_CENTER);
+  if (interruptibleDelay(300)) return true;
+
+  long dCenter = checkDistanceMedian();
+  if (dCenter > DIST_SAFE) {
+    Serial.println(F("Szabad ut -> indulas"));
+  } else {
+    Serial.println(F("Akadaly elotte -> azonnali manover"));
+  }
+
+  obstacleInitialized = true;
+  return false;
+}
+
+// =====================================================
+// AKADALYKERULES MANOVER
+// =====================================================
+bool handleAvoidanceManuever() {
+  stopMotors();
+  if (interruptibleDelay(80)) return true;
+
+  long dNow = checkDistanceMedian();
+  if (dNow < 20) {
+    Serial.println(F("Tul kozel -> HATRA"));
+    moveBackward();
+    if (interruptibleDelay(350)) { stopMotors(); return true; }
+    stopMotors();
+    if (interruptibleDelay(100)) return true;
+  }
+
+  long dL, dC, dR;
+  int best = scan3Points(dL, dC, dR);
+  if (best == -99) return true;
+
+  if (best == 0) {
+    Serial.println(F("Kozep tisztult, mehet elore"));
+    return false;
+  }
+  else if (best == -2) {
+    Serial.println(F("Mindket oldal foglalt -> 180 fok"));
+    spinLeft();
+    if (interruptibleDelay(900)) { stopMotors(); return true; }
+    stopMotors();
+  }
+  else if (best == -1) {
+    Serial.println(F("Fordulas BALRA"));
+    spinLeft();
+    if (interruptibleDelay(450)) { stopMotors(); return true; }
+    stopMotors();
+    if (interruptibleDelay(100)) return true;
+    if (checkDistance() < DIST_STOP) {
+      spinLeft();
+      if (interruptibleDelay(300)) { stopMotors(); return true; }
+      stopMotors();
+    }
+  }
+  else {
+    Serial.println(F("Fordulas JOBBRA"));
+    spinRight();
+    if (interruptibleDelay(450)) { stopMotors(); return true; }
+    stopMotors();
+    if (interruptibleDelay(100)) return true;
+    if (checkDistance() < DIST_STOP) {
+      spinRight();
+      if (interruptibleDelay(300)) { stopMotors(); return true; }
+      stopMotors();
+    }
+  }
+
+  if (interruptibleDelay(100)) return true;
+  return false;
+}
+
+// =====================================================
+// PERIODIKUS ELLENORZES (~50 cm)
+// =====================================================
+bool periodicCheck() {
+  Serial.println(F("=== ~50 cm megtettem, ellenorzes ==="));
+  stopMotors();
+  if (interruptibleDelay(100)) return true;
+
+  long dL, dC, dR;
+  int best = scan3Points(dL, dC, dR);
+  if (best == -99) return true;
+
+  if (best == 0) {
+    Serial.println(F("Szabad ut, folytatas"));
+    return false;
+  }
+  Serial.println(F("Megelozo manover"));
+  if (best == -2) {
+    spinLeft();
+    if (interruptibleDelay(900)) { stopMotors(); return true; }
+    stopMotors();
+  }
+  else if (best == -1) {
+    spinLeft();
+    if (interruptibleDelay(450)) { stopMotors(); return true; }
+    stopMotors();
+  }
+  else {
+    spinRight();
+    if (interruptibleDelay(450)) { stopMotors(); return true; }
+    stopMotors();
+  }
+  if (interruptibleDelay(100)) return true;
+  return false;
+}
+
+// =====================================================
+// VONALKOVETES - aranyos motorvezerlessel
+// =====================================================
+// A te szenzoraidnal: 1 = LATJA a fekete vonalat (a logbol kiderult)
+//
+// === SEBESSEG BEALLITASOK ===
+const int LINE_FAST    = 255;
+const int LINE_TURN_O  = 255;
+const int LINE_TURN_I  = 140;
+
+// Vonal elveszteseg utan max ennyi ideig keres, aztan megall
+const unsigned long LINE_SEARCH_TIMEOUT_MS = 4000;
+unsigned long lineLostStartMs = 0;
+bool isLineLost = false;
+unsigned long searchPhaseStartMs = 0;
+
+void runLineFollow() {
+  // Akadaly ellenorzes (ritkabban, hogy ne blokkoljon)
+  unsigned long now = millis();
+  if (now - lastSensorMs >= 250) {
+    lastSensorMs = now;
+    lastDistance = checkDistance();
+  }
+
+  if (lastDistance < DIST_LINE_STOP) {
+    stopMotors();
+    Serial.println(F("Akadaly a vonalon - megallok"));
+    currentState = STANDBY;
+    return;
+  }
+
+  bool L = digitalRead(L_SENS);
+  bool M = digitalRead(M_SENS);
+  bool R = digitalRead(R_SENS);
+
+  // Debug csak valtozasnal
+  static byte lastSensorState = 0xFF;
+  byte sensorState = (L << 2) | (M << 1) | R;
+  if (sensorState != lastSensorState) {
+    lastSensorState = sensorState;
+    Serial.print(F("L:")); Serial.print(L);
+    Serial.print(F(" M:")); Serial.print(M);
+    Serial.print(F(" R:")); Serial.println(R);
+  }
+
+  // === Kozep latja: a vonalon vagyunk ===
+  if (M) {
+    isLineLost = false;
+    if (!L && !R) {
+      // Egyenes vonal kozepen
+      driveCurve(LINE_FAST, LINE_FAST);
+      // FONTOS: lastLineDirection NEM nullazodik!
+      // Emlekszunk az utolso valodi kanyaratra, hogy ha elveszitjuk
+      // a vonalat, abba az iranyba keressuk.
+    } else if (L && !R) {
+      driveCurve(LINE_TURN_I, LINE_TURN_O);
+      lastLineDirection = -1;
+    } else if (!L && R) {
+      driveCurve(LINE_TURN_O, LINE_TURN_I);
+      lastLineDirection = 1;
+    } else {
+      // L && M && R - kereszt/T-elagazas
+      driveCurve(LINE_FAST, LINE_FAST);
+    }
+    return;
+  }
+
+  // === Csak szel latja (eles kanyar) ===
+  if (L && !R) {
+    spinLeft();
+    lastLineDirection = -1;
+    isLineLost = false;
+    return;
+  }
+  if (R && !L) {
+    spinRight();
+    lastLineDirection = 1;
+    isLineLost = false;
+    return;
+  }
+  if (L && R) {
+    // Mindket szel, kozep nem - ferde kereszt vagy elagazas
+    driveCurve(LINE_FAST, LINE_FAST);
+    isLineLost = false;
+    return;
+  }
+
+  // === VONAL ELVESZETT (mind 0) ===
+  // Az utolso kanyar iranya alapjan kezdjuk a keresest.
+  // Ha nem volt meg kanyar (lastLineDirection==0), lengo keresest csinalunk.
+  if (!isLineLost) {
+    isLineLost = true;
+    lineLostStartMs = now;
+    searchPhaseStartMs = now;
+    Serial.print(F("VONAL ELVESZETT, utolso irany: "));
+    if (lastLineDirection == -1) Serial.println(F("BAL"));
+    else if (lastLineDirection == 1) Serial.println(F("JOBB"));
+    else Serial.println(F("nincs (lengo kereses)"));
+  }
+
+  // Timeout: ha tul soka tart, alljunk meg
+  if (now - lineLostStartMs > LINE_SEARCH_TIMEOUT_MS) {
+    stopMotors();
+    Serial.println(F("KERESES TIMEOUT - STANDBY"));
+    currentState = STANDBY;
+    isLineLost = false;
+    return;
+  }
+
+  // === Keresesi strategia ===
+  // 1) Ha tudjuk az utolso iranyt (-1 vagy 1), abba az iranyba forduljunk
+  //    folyamatosan, amig meg nem talaljuk vagy lejar a timeout.
+  //    Ez a leggyakoribb eset: kanyar utan elveszett a vonal.
+  // 2) Ha nem volt meg kanyar (lastLineDirection==0, pl. a robot rossz iranyban
+  //    indult), akkor LENGO keresest csinalunk: balra majd jobbra egyre
+  //    szelesebb szogben.
+  if (lastLineDirection != 0) {
+    if (lastLineDirection == -1) {
+      spinLeft();
+    } else {
+      spinRight();
+    }
+  } else {
+    // Lengo kereses: 0-400 ms BAL, 400-1200 JOBB, 1200-2400 BAL,
+    // 2400-4000 JOBB (egyre nagyobb idotartam = szelesebb szog)
+    unsigned long phaseElapsed = now - searchPhaseStartMs;
+    if (phaseElapsed < 400) {
+      spinLeft();
+    } else if (phaseElapsed < 1200) {
+      spinRight();
+    } else if (phaseElapsed < 2400) {
+      spinLeft();
+    } else {
+      spinRight();
+    }
+  }
+}
+
+// =====================================================
+// IR PARANCSOK
+// =====================================================
+void handleCommand(uint16_t cmd) {
+  if (cmd == 0x45) { currentState = STANDBY; stopMotors(); headServo.write(SERVO_CENTER); obstacleInitialized = false; Serial.println(F(">>> STANDBY")); return; }
+  if (cmd == 0x46) { currentState = OFF;     stopMotors(); headServo.write(SERVO_CENTER); Serial.println(F(">>> OFF")); return; }
+  if (cmd == 0x47) { currentState = STANDBY; stopMotors(); headServo.write(SERVO_CENTER); obstacleInitialized = false; Serial.println(F(">>> KILEPES")); return; }
+
+  if (currentState == OFF) return;
+
+  if (cmd == 0x1C) {
+    stopMotors();
+    if (currentState != MANUAL) {
+      currentState = STANDBY;
+      headServo.write(SERVO_CENTER);
+      obstacleInitialized = false;
+      Serial.println(F(">>> STOP -> STANDBY"));
+    } else {
+      Serial.println(F(">>> STOP"));
+    }
+    return;
+  }
+
+  if (cmd == 0x44) { currentState = LINE_FOLLOW;    stopMotors(); lastLineDirection = 0; Serial.println(F(">>> VONALKOVETES")); return; }
+  if (cmd == 0x40) { currentState = OBSTACLE_AVOID; stopMotors(); obstacleInitialized = false; Serial.println(F(">>> AKADALYKERULES")); return; }
+  if (cmd == 0x43) { currentState = MANUAL;         stopMotors(); Serial.println(F(">>> MANUALIS")); return; }
+
+  if (currentState == MANUAL) {
+    switch (cmd) {
+      case 0x18: moveForward();  break;
+      case 0x08: manualLeft();   break;
+      case 0x5A: manualRight();  break;
+      case 0x52: moveBackward(); break;
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("Robot inditas..."));
+
+  IrReceiver.begin(RECV_PIN);
+
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  pinMode(L_SENS, INPUT); pinMode(M_SENS, INPUT); pinMode(R_SENS, INPUT);
+
+  headServo.attach(SERVO_PIN);
+  headServo.write(SERVO_CENTER);
+  delay(500);
+  stopMotors();
+
+  for (int i = 0; i < 4; i++) {
+    checkDistance();
+    delay(100);
+  }
+
+  Serial.println(F("Keszen all. CH- bekapcs."));
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  // IR
+  if (IrReceiver.decode()) {
+    uint16_t cmd = IrReceiver.decodedIRData.command;
+    if (cmd != 0) {
+      Serial.print(F("IR: 0x"));
+      Serial.println(cmd, HEX);
+      handleCommand(cmd);
+    }
+    IrReceiver.resume();
+  }
+
+  // Vonalkovetes
+  if (currentState == LINE_FOLLOW) {
+    runLineFollow();
+  }
+
+  // Akadalykerules
+  if (currentState == OBSTACLE_AVOID) {
+    if (!obstacleInitialized) {
+      if (initialScan()) return;
+      return;
+    }
+
+    unsigned long now = millis();
+    if (now - lastSensorMs >= SENSOR_INTERVAL) {
+      lastSensorMs = now;
+      lastDistance = checkDistance();
+    }
+
+    if (lastDistance < DIST_STOP) {
+      stopMotors();
+      Serial.print(F("AKADALY ")); Serial.print(lastDistance); Serial.println(F(" cm - STOP!"));
+      if (handleAvoidanceManuever()) return;
+    }
+    else if (isMovingForward && (now - forwardStartMs >= CHECK_INTERVAL_MS)) {
+      Serial.print(F("Megtett ido: ")); Serial.print(now - forwardStartMs); Serial.println(F(" ms"));
+      if (periodicCheck()) return;
+    }
+    else {
+      moveForward();
+    }
+  }
+}

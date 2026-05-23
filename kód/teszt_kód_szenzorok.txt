@@ -1,0 +1,61 @@
+// --- Motor labak ---
+#define ENA 5
+#define IN1 2
+#define IN2 4
+#define IN3 7
+#define IN4 8
+#define ENB 10
+
+// --- Szenzor labak ---
+#define TRIG A1
+#define ECHO A0
+#define S_BAL 6
+#define S_KOZEP 9
+#define S_JOBB 11
+#define SZERVO_PIN 3
+
+#include <Servo.h>
+Servo myServo;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Robot Auto Teszt Indul...");
+
+  // Motorok beallitasa
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+
+  // Szenzorok beallitasa
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+  pinMode(S_BAL, INPUT);
+  pinMode(S_KOZEP, INPUT);
+  pinMode(S_JOBB, INPUT);
+
+  myServo.attach(SZERVO_PIN);
+  myServo.write(90); // Kozepallas
+}
+
+void loop() {
+  // 1. Vonalkovetok tesztje (0 = feher, 1 = fekete)
+  int bal = digitalRead(S_BAL);
+  int kozep = digitalRead(S_KOZEP);
+  int jobb = digitalRead(S_JOBB);
+
+  // 2. Ultrahang tesztje
+  digitalWrite(TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  long duration = pulseIn(ECHO, HIGH);
+  int tavolsag = duration * 0.034 / 2;
+
+  // Kiiras a monitorra
+  Serial.print("Szenzorok [B K J]: ");
+  Serial.print(bal); Serial.print(" ");
+  Serial.print(kozep); Serial.print(" ");
+  Serial.print(jobb);
+  Serial.print(" | Tavolsag: "); Serial.print(tavolsag);
+  Serial.println(" cm");
+
+  delay(500); // Fel masodpercenkent frissit
+}
